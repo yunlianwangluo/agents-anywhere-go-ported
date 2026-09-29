@@ -1,0 +1,6 @@
+server_url: http://127.0.0.1:8080
+connector_id: workstation-001
+client_key: local-test-key
+bridge_endpoint: /Users/your-name/.dsh/agents-anywhere/bridge/endpoint.json
+workspace_roots:
+  - /Users/your-name/workspace

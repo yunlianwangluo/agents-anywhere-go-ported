@@ -1,0 +1,10 @@
+# Build output produced by build.sh
+build/
+
+# Default local storage roots and runtime data
+var/
+bin/
+
+# Logs and OS noise
+*.log
+.DS_Store
