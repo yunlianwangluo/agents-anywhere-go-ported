@@ -35,7 +35,9 @@ type Server struct {
 
 	sessionMu      sync.Mutex
 	sessionClients map[string]map[*sessionConn]struct{}
-	sessionSeq     map[string]int64
+
+	timelineMu sync.Mutex
+	timelines  map[string]*timelineCache
 }
 
 // New assembles a Server with the dependencies the entry point loaded.
@@ -48,7 +50,7 @@ func New(cfg config.Config, repo *storage.Repository, hub *connector.Hub) *Serve
 		projects:       make(map[string]map[string]any),
 		clients:        make(map[*websocket.Conn]struct{}),
 		sessionClients: make(map[string]map[*sessionConn]struct{}),
-		sessionSeq:     make(map[string]int64),
+		timelines:      make(map[string]*timelineCache),
 	}
 }
 

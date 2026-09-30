@@ -85,6 +85,8 @@ func Register(c *Controller) {
 	beego.Post("/api/v2/sessions/:id/attachments", c.auth(c.uploadAttachment))
 	beego.Get("/api/v2/attachments/:fileId", c.auth(c.downloadAttachment))
 	beego.Get("/api/v2/sessions/:id/attachments/:fileId", c.auth(c.downloadAttachment))
+	// The connector fetches raw bytes here before staging them for the bridge.
+	beego.Get("/api/v2/connector/sessions/:id/attachments/:fileId/content", c.auth(c.connectorAttachmentContent))
 
 	// Runtime actions forwarded to the connector.
 	beego.Post("/api/v2/sessions", c.auth(func(ctx *beegoctx.Context) { c.forwardSession(ctx, "session.createAndStart") }))

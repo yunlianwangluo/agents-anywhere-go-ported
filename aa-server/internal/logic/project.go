@@ -132,7 +132,7 @@ func (s *Server) ResolveProject(connectorID, id, cwd string) map[string]any {
 	if canonical := s.ProjectByPath(connectorID, cwd); canonical != nil {
 		return canonical
 	}
-	metas, _ := s.SyncSessions()
+	metas, _ := s.sessionIndex()
 	for _, meta := range metas {
 		projectIDValue := view.FirstNonEmpty(meta.ProjectID, view.ProjectID(meta.ConnectorID, meta.CWD))
 		if projectIDValue == id && meta.ConnectorID == connectorID && meta.CWD != "" {
@@ -166,8 +166,8 @@ func (s *Server) projectNameOwner(name, ignoreID string) string {
 
 // ProjectList renders every project plus the ones implied by known sessions.
 func (s *Server) ProjectList() (int, any) {
-	metas, err := s.SyncSessions()
-	if err != nil && len(s.hub.IDs()) > 0 {
+	metas, err := s.sessionIndex()
+	if err != nil {
 		return http.StatusServiceUnavailable, map[string]any{"detail": err.Error()}
 	}
 	projects := s.projectsSnapshot()
@@ -198,7 +198,7 @@ func (s *Server) ProjectList() (int, any) {
 // ProjectSessions lists the sessions attached to one project, resolving
 // duplicate project ids to the canonical record.
 func (s *Server) ProjectSessions(projectIDValue string) (int, any) {
-	metas, err := s.SyncSessions()
+	metas, err := s.sessionIndex()
 	if err != nil {
 		return http.StatusBadGateway, map[string]any{"detail": err.Error()}
 	}

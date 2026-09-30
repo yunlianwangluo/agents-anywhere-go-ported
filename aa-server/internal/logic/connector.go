@@ -67,6 +67,11 @@ func (s *Server) SyncSessions() ([]storage.SessionMeta, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Remember the connector so the device list still works while it is offline.
+	_ = s.repo.SaveConnector(conn.ID, map[string]any{
+		"id": conn.ID, "userId": "local-admin", "name": "Local Mac",
+		"connectorKind": "desktop", "deviceOs": "macos", "lastSeenAt": view.Now(),
+	})
 	for _, session := range response.Sessions {
 		if session.SessionID == "" {
 			continue
@@ -80,6 +85,24 @@ func (s *Server) SyncSessions() ([]storage.SessionMeta, error) {
 		}
 	}
 	return s.repo.ListMeta()
+}
+
+// sessionIndex returns the connector's session inventory, falling back to the
+// local mirror when the connector is offline. The mirror is a cache of DSH, so
+// serving it keeps history reachable from the phone without a live connector.
+func (s *Server) sessionIndex() ([]storage.SessionMeta, error) {
+	metas, err := s.SyncSessions()
+	if err == nil {
+		return metas, nil
+	}
+	if len(s.hub.IDs()) > 0 {
+		return nil, err
+	}
+	cached, cacheErr := s.repo.ListMeta()
+	if cacheErr != nil {
+		return nil, err
+	}
+	return cached, nil
 }
 
 // CanonicalSessionID maps a connector-reported id back to the local session id;
@@ -117,9 +140,7 @@ func (s *Server) IngestNotification(connectorID string, message connector.Messag
 		return
 	}
 	meta := s.mergeSessionMeta(sessionID, connectorID, params)
-	if message.Method == "timeline.sync" || message.Method == "timeline.item.upsert" || message.Method == "session.state.update" {
-		_ = s.repo.AppendTimeline(sessionID, params)
-	}
+	changed, replaced := s.mirrorTimeline(sessionID, message.Method, params)
 	if message.Method == "" {
 		return
 	}
@@ -128,16 +149,48 @@ func (s *Server) IngestNotification(connectorID string, message connector.Messag
 	case "notice.upsert":
 		// The client renders interactions from live notices, so a pending
 		// question must reach the session socket as a projection event.
-		s.PushSessionEvent(sessionID, "runtime.notice.updated", map[string]any{"notice": view.NormalizeNotice(params, sessionID)})
+		s.PushSessionEvent(sessionID, s.timelineWatermark(sessionID), "runtime.notice.updated", map[string]any{"notice": view.NormalizeNotice(params, sessionID)})
 	case "session.state.update":
-		s.PushSessionEvent(sessionID, "runtime.state.updated", map[string]any{"state": view.RuntimeState(meta, view.RuntimeStateOptions{
+		s.saveRuntimeState(sessionID, params)
+		s.PushSessionEvent(sessionID, s.timelineWatermark(sessionID), "runtime.state.updated", map[string]any{"state": view.RuntimeState(meta, view.RuntimeStateOptions{
 			Status:     view.StringValue(params["status"]),
 			Selections: params["selections"],
 			Metadata:   params["metadata"],
 		})})
 	default:
-		s.PushLiveTimeline(sessionID, connectorID)
+		if replaced {
+			// A full projection may have dropped items, so the client gets the
+			// window rather than a diff it cannot interpret.
+			s.PushTimelineSnapshot(sessionID)
+			return
+		}
+		s.PushTimelineItems(sessionID, changed)
 	}
+}
+
+// mirrorTimeline keeps the local copy of the conversation in step with the
+// connector: a complete snapshot replaces the effective set, while single item
+// updates merge into it. It reports what changed so the live stream forwards
+// exactly that, straight from the mirror instead of re-reading the bridge.
+func (s *Server) mirrorTimeline(sessionID, method string, params map[string]any) ([]timelineItem, bool) {
+	switch method {
+	case "timeline.sync":
+		items, _ := params["items"].([]any)
+		incoming := make([]map[string]any, 0, len(items))
+		for _, raw := range items {
+			if item, ok := raw.(map[string]any); ok {
+				incoming = append(incoming, item)
+			}
+		}
+		return s.ingestTimeline(sessionID, incoming, true), true
+	case "timeline.item.upsert":
+		item, ok := params["item"].(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		return s.ingestTimeline(sessionID, []map[string]any{item}, false), false
+	}
+	return nil, false
 }
 
 // pushRuntimeErrorNotice turns a connector runtime failure into a notice the
@@ -164,10 +217,29 @@ func (s *Server) pushRuntimeErrorNotice(sessionID string, params map[string]any)
 		"source":   map[string]any{"runtime": "dsh", "component": "connector"},
 		"context":  map[string]any{"code": code, "details": params["details"]},
 		"metadata": map[string]any{},
-		"revision": 1,
 		"actions":  []any{},
 	}, sessionID)
-	s.PushSessionEvent(sessionID, "runtime.notice.updated", map[string]any{"notice": notice})
+	persisted, err := s.repo.UpsertRuntimeNotice(sessionID, notice)
+	if err != nil {
+		return
+	}
+	statePayload := map[string]any{
+		"status":       "error",
+		"statusReason": message,
+		"error":        map[string]any{"code": code, "message": message, "details": params["details"]},
+	}
+	s.saveRuntimeState(sessionID, statePayload)
+	meta, err := s.repo.ReadMeta(sessionID)
+	if err != nil {
+		meta = storage.SessionMeta{ID: sessionID, Runtime: "dsh"}
+	}
+	state := view.RuntimeState(meta, view.RuntimeStateOptions{
+		Status:       "error",
+		StatusReason: message,
+		Error:        statePayload["error"],
+	})
+	s.PushSessionEvent(sessionID, s.timelineWatermark(sessionID), "runtime.state.updated", map[string]any{"state": state})
+	s.PushSessionEvent(sessionID, s.timelineWatermark(sessionID), "runtime.notice.updated", map[string]any{"notice": persisted})
 }
 
 // mergeSessionMeta refreshes the identity a notification carries without wiping
@@ -189,34 +261,4 @@ func (s *Server) mergeSessionMeta(sessionID, connectorID string, params map[stri
 	}
 	_ = s.repo.SaveMeta(meta)
 	return meta
-}
-
-// PushLiveTimeline re-reads the conversation and forwards it to the phones
-// watching this session, so a reply appears without a manual refresh.
-func (s *Server) PushLiveTimeline(sessionID, connectorID string) {
-	s.sessionMu.Lock()
-	watching := len(s.sessionClients[sessionID]) > 0
-	s.sessionMu.Unlock()
-	if !watching {
-		return
-	}
-	go func() {
-		meta, err := s.repo.ReadMeta(sessionID)
-		if err != nil {
-			return
-		}
-		result, err := s.CallConnector("session.getSnapshot", map[string]any{"connectorId": connectorID, "sessionId": sessionID, "externalSessionId": meta.ExternalID, "limit": 100})
-		if err != nil {
-			return
-		}
-		var snapshot map[string]any
-		if json.Unmarshal(result, &snapshot) != nil {
-			return
-		}
-		items, _ := snapshot["items"]
-		if items == nil {
-			items = []any{}
-		}
-		s.PushSessionEvent(sessionID, "timeline.snapshot", map[string]any{"items": items})
-	}()
 }

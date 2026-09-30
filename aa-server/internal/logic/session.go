@@ -14,8 +14,8 @@ import (
 // SessionList renders every mirrored session, resolving project ids to their
 // canonical record.
 func (s *Server) SessionList() (int, any) {
-	metas, err := s.SyncSessions()
-	if err != nil && len(s.hub.IDs()) > 0 {
+	metas, err := s.sessionIndex()
+	if err != nil {
 		return http.StatusServiceUnavailable, map[string]any{"detail": err.Error()}
 	}
 	sessions := make([]map[string]any, 0, len(metas))
@@ -100,21 +100,38 @@ func (s *Server) SessionDetail(id string) (int, any) {
 	if err != nil {
 		return http.StatusNotFound, map[string]any{"error": "session not found"}
 	}
-	timeline, _ := s.repo.ReadTimeline(id)
+	timeline := itemPayloads(s.cachedItems(id))
 	return http.StatusOK, map[string]any{"session": meta, "timeline": timeline}
 }
 
-// SessionTimeline returns the locally mirrored timeline.
-func (s *Server) SessionTimeline(id string) (int, any) {
+// TimelineQuery carries the client's paging parameters for a timeline read.
+type TimelineQuery struct {
+	Mode           string
+	AfterSeq       int
+	BeforeOrderSeq int
+	Limit          int
+}
+
+// SessionTimeline serves a page of the mirrored timeline. The mirror holds the
+// same items DSH projects, so history stays readable without a live connector.
+func (s *Server) SessionTimeline(id string, query TimelineQuery) (int, any) {
 	if _, err := s.repo.ReadMeta(id); err != nil {
 		return http.StatusNotFound, map[string]any{"detail": "session not found"}
 	}
-	items, _ := s.repo.ReadTimeline(id)
-	return http.StatusOK, map[string]any{"sessionId": id, "items": items, "nextSeq": len(items), "hasMore": false, "serverTime": view.Now()}
+	window, nextSeq, hasMore := timelineWindow(s.cachedItems(id), query.Mode, query.AfterSeq, query.BeforeOrderSeq, query.Limit)
+	return http.StatusOK, map[string]any{
+		"sessionId":  id,
+		"items":      itemPayloads(window),
+		"nextSeq":    nextSeq,
+		"hasMore":    hasMore,
+		"serverTime": view.Now(),
+	}
 }
 
-// SessionEvents replays the stored timeline after the client's cursor so a
-// recovering phone can resume without re-fetching the whole snapshot.
+// SessionEvents replays the mirrored timeline after the client's cursor so a
+// recovering phone can resume without re-fetching the whole snapshot. The
+// sequence is the item's own update sequence, which is the same number live
+// frames carry, so a cursor from either source means the same thing.
 func (s *Server) SessionEvents(id, after string) (int, any) {
 	if _, err := s.repo.ReadMeta(id); err != nil {
 		return http.StatusNotFound, map[string]any{"detail": "session not found"}
@@ -123,20 +140,19 @@ func (s *Server) SessionEvents(id, after string) (int, any) {
 	if raw := strings.TrimPrefix(after, "seq:"); raw != "" {
 		_, _ = fmt.Sscan(raw, &cursor)
 	}
-	values, _ := s.repo.ReadTimeline(id)
-	events := make([]map[string]any, 0)
 	next := cursor
-	for index, value := range values {
-		sequence := int64(index + 1)
-		if sequence <= cursor {
+	events := make([]map[string]any, 0)
+	for _, item := range s.cachedItems(id) {
+		sequence := int64(item.UpdatedSeq)
+		// A DSH log position covers every streaming revision of an item, so the
+		// replay re-sends whatever sits at the cursor: it may be a newer revision
+		// of something the client already holds. Over-sending a boundary item is
+		// harmless, missing it leaves the phone with a stale revision.
+		if sequence < cursor {
 			continue
 		}
-		// Advance past every stored record, including the ones that are not
-		// client events, so recovery never re-reads the same window forever.
-		next = sequence
-		if event, ok := view.StoredSessionEvent(id, sequence, value); ok {
-			events = append(events, event)
-		}
+		next = max(next, sequence)
+		events = append(events, view.SessionEnvelope(id, sequence, "timeline.item_updated", map[string]any{"item": item.Raw}))
 	}
 	return http.StatusOK, map[string]any{
 		"events":           events,
@@ -146,37 +162,71 @@ func (s *Server) SessionEvents(id, after string) (int, any) {
 	}
 }
 
-// SessionSnapshot renders everything the client needs to draw one session.
+// snapshotItemLimit bounds the first page the phone renders.
+const snapshotItemLimit = 100
+
+// SessionSnapshot renders everything the client needs to draw one session. The
+// connector stays authoritative for content, but an unreachable or unaware DSH
+// falls back to the local mirror so history remains readable.
 func (s *Server) SessionSnapshot(id string) (int, any) {
 	meta, err := s.repo.ReadMeta(id)
 	if err != nil {
 		return http.StatusNotFound, map[string]any{"detail": "session not found"}
 	}
-	result, err := s.CallConnector("session.getSnapshot", map[string]any{"sessionId": id, "externalSessionId": meta.ExternalID, "limit": 100})
-	if err != nil {
-		return http.StatusBadGateway, map[string]any{"detail": err.Error()}
-	}
-	var snapshot map[string]any
-	if json.Unmarshal(result, &snapshot) != nil {
-		return http.StatusBadGateway, map[string]any{"detail": "invalid DSH snapshot"}
-	}
-	items, _ := snapshot["items"]
-	if items == nil {
-		items = []any{}
+	items, fromCache := s.snapshotItems(meta)
+	window, nextSeq, hasMore := timelineWindow(items, "latest", 0, 0, snapshotItemLimit)
+	session := view.SessionView(meta)
+	if fromCache {
+		// The client passes this field through; it marks the payload as a copy
+		// rather than a fresh connector read.
+		session["sourceObservationOrigin"] = "cache"
 	}
 	capabilities := s.sessionCapabilitySet(meta)
 	return http.StatusOK, map[string]any{
-		"session":               view.SessionView(meta),
+		"session":               session,
 		"state":                 s.runtimeState(meta),
-		"timeline":              map[string]any{"items": items, "nextSeq": 0, "hasMore": false},
+		"timeline":              map[string]any{"items": itemPayloads(window), "nextSeq": nextSeq, "hasMore": hasMore},
 		"approvals":             []any{},
 		"notices":               s.sessionNotices(meta),
 		"effectiveCapabilities": capabilities,
 		"runtimeCapabilities":   capabilities,
 		"catalogs":              map[string]any{},
-		"eventCursor":           "seq:0",
+		"eventCursor":           fmt.Sprintf("seq:%d", s.timelineWatermark(id)),
 		"serverTime":            view.Now(),
 	}
+}
+
+// snapshotItems returns the session's timeline, refreshing the mirror while the
+// connector answers and falling back to it when it cannot.
+func (s *Server) snapshotItems(meta storage.SessionMeta) ([]timelineItem, bool) {
+	params := sessionParams(meta)
+	params["limit"] = snapshotItemLimit
+	result, err := s.CallConnector("session.getSnapshot", params)
+	if err == nil {
+		var snapshot map[string]any
+		if json.Unmarshal(result, &snapshot) == nil {
+			s.mirrorSnapshot(meta.ID, snapshot)
+			return s.cachedItems(meta.ID), false
+		}
+	}
+	return s.cachedItems(meta.ID), true
+}
+
+// mirrorSnapshot folds a connector snapshot into the mirror: a complete page
+// replaces the effective set, a partial page merges so older items survive.
+func (s *Server) mirrorSnapshot(sessionID string, snapshot map[string]any) {
+	items, _ := snapshot["items"].([]any)
+	incoming := make([]map[string]any, 0, len(items))
+	for _, raw := range items {
+		if item, ok := raw.(map[string]any); ok {
+			incoming = append(incoming, item)
+		}
+	}
+	if len(incoming) == 0 {
+		return
+	}
+	complete, _ := snapshot["complete"].(bool)
+	s.ingestTimeline(sessionID, incoming, complete)
 }
 
 // sessionCapabilitySet never fails: the client treats a missing capability set
@@ -269,7 +319,8 @@ func (s *Server) SessionRuntimeAction(id, method string, payload map[string]any)
 func (s *Server) CreateAndStart(payload map[string]any) (int, any) {
 	params := payload
 	connectorID, projectIDValue := view.StringValue(params["connectorId"]), view.StringValue(params["projectId"])
-	if connectorID == "" || projectIDValue == "" || view.StringValue(params["content"]) == "" {
+	references, _ := params["attachments"].([]any)
+	if connectorID == "" || projectIDValue == "" || (view.StringValue(params["content"]) == "" && len(references) == 0) {
 		return http.StatusBadRequest, map[string]any{"detail": "connectorId, projectId and content are required"}
 	}
 	project := s.ResolveProject(connectorID, projectIDValue, view.StringValue(params["cwd"]))
@@ -280,6 +331,13 @@ func (s *Server) CreateAndStart(payload map[string]any) (int, any) {
 	id := fmt.Sprintf("session-%d", time.Now().UnixNano())
 	params["sessionId"] = id
 	params["cwd"] = project["workspacePath"]
+	// The client sends the first message's files inline here, because a session
+	// scoped upload path does not exist until the session does.
+	if attachments := s.resolveAttachments(id, params["attachments"]); len(attachments) > 0 {
+		params["attachments"] = attachments
+	} else {
+		delete(params, "attachments")
+	}
 	if s.agentPreset != "" && params["agentPreset"] == nil {
 		params["agentPreset"] = s.agentPreset
 	}
@@ -326,7 +384,8 @@ func (s *Server) ForwardSession(id, method string, payload map[string]any) (int,
 		sessionID = id
 		params["sessionId"] = sessionID
 	}
-	if view.StringValue(params["content"]) == "" {
+	references, _ := params["attachments"].([]any)
+	if view.StringValue(params["content"]) == "" && len(references) == 0 {
 		return http.StatusBadRequest, map[string]any{"ok": false, "error": map[string]any{"code": "INVALID_PARAMS", "message": "content is required"}}
 	}
 	meta, err := s.repo.ReadMeta(sessionID)
@@ -339,6 +398,13 @@ func (s *Server) ForwardSession(id, method string, payload map[string]any) (int,
 	params["externalSessionId"] = meta.ExternalID
 	if view.StringValue(params["cwd"]) == "" && meta.CWD != "" {
 		params["cwd"] = meta.CWD
+	}
+	// The client references attachments by id; the bridge needs the metadata and
+	// the connector fetches the bytes itself.
+	if attachments := s.resolveAttachments(sessionID, params["attachments"]); len(attachments) > 0 {
+		params["attachments"] = attachments
+	} else {
+		delete(params, "attachments")
 	}
 	if params["clientMessageId"] == nil {
 		params["clientMessageId"] = fmt.Sprintf("message-%d", time.Now().UnixNano())

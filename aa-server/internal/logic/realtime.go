@@ -48,18 +48,10 @@ func (s *Server) Broadcast(value any) {
 	}
 }
 
-// NextSessionSequence hands out strictly increasing cursors per session.
-func (s *Server) NextSessionSequence(sessionID string) int64 {
-	s.sessionMu.Lock()
-	defer s.sessionMu.Unlock()
-	s.sessionSeq[sessionID]++
-	return s.sessionSeq[sessionID]
-}
-
 // PushSessionEvent forwards a live frame to the phones watching this session.
-// The client reconnects when a socket stays silent, so pushes and keepalives
-// both keep the stream healthy.
-func (s *Server) PushSessionEvent(sessionID, typeName string, payload any) {
+// The sequence is the caller's timeline watermark, never a private counter: the
+// client keeps one cursor and rejects any frame below it.
+func (s *Server) PushSessionEvent(sessionID string, sequence int64, typeName string, payload any) {
 	s.sessionMu.Lock()
 	clients := make([]*sessionConn, 0, len(s.sessionClients[sessionID]))
 	for conn := range s.sessionClients[sessionID] {
@@ -69,15 +61,34 @@ func (s *Server) PushSessionEvent(sessionID, typeName string, payload any) {
 	if len(clients) == 0 {
 		return
 	}
-	event := view.SessionEnvelope(sessionID, s.NextSessionSequence(sessionID), typeName, payload)
+	event := view.SessionEnvelope(sessionID, sequence, typeName, payload)
 	for _, conn := range clients {
 		_ = conn.write(event)
 	}
 }
 
+// PushTimelineItems forwards the items the mirror just changed. Single item
+// frames keep the stream cheap and carry the stamped sequence the client sorts
+// and merges on.
+func (s *Server) PushTimelineItems(sessionID string, items []timelineItem) {
+	for _, item := range items {
+		s.PushSessionEvent(sessionID, int64(item.UpdatedSeq), "timeline.item_updated", map[string]any{"item": item.Raw})
+	}
+}
+
+// PushTimelineSnapshot forwards the mirror's current window, which is what a
+// replayed or replaced timeline looks like to a watching phone.
+func (s *Server) PushTimelineSnapshot(sessionID string) {
+	window, nextSeq, hasMore := timelineWindow(s.cachedItems(sessionID), "latest", 0, 0, snapshotItemLimit)
+	if len(window) == 0 {
+		return
+	}
+	s.PushSessionEvent(sessionID, int64(nextSeq), "timeline.snapshot", map[string]any{"items": itemPayloads(window), "hasMore": hasMore})
+}
+
 // DashboardSnapshot renders the aggregate view the dashboard socket streams.
 func (s *Server) DashboardSnapshot() map[string]any {
-	metas, _ := s.SyncSessions()
+	metas, _ := s.sessionIndex()
 	ids := s.hub.IDs()
 	connectors := make([]map[string]any, 0, len(ids))
 	for _, id := range ids {

@@ -16,6 +16,10 @@ import (
 
 type Handler func(map[string]any) (any, error)
 type NotificationHandler func(map[string]any)
+type RPCError struct{ Payload map[string]any }
+
+func (e RPCError) Error() string { return fmt.Sprint(e.Payload["message"]) }
+
 type Config struct{ ServerURL, ConnectorID, ClientKey string }
 type Client struct {
 	cfg          Config
@@ -105,7 +109,11 @@ func (c *Client) dispatch(message map[string]any) {
 	result, err := c.handler(message)
 	response := map[string]any{"type": "rpc.response", "requestId": message["requestId"]}
 	if err != nil {
-		response["error"] = map[string]any{"code": "INTERNAL_ERROR", "message": err.Error()}
+		if rpcError, ok := err.(RPCError); ok {
+			response["error"] = rpcError.Payload
+		} else {
+			response["error"] = map[string]any{"code": "INTERNAL_ERROR", "message": err.Error()}
+		}
 	} else {
 		response["result"] = result
 	}

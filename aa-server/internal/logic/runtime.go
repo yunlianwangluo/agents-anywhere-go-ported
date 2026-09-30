@@ -7,14 +7,43 @@ import (
 	"aa-server/internal/view"
 )
 
-// DeviceList renders every connected connector as a device.
+// DeviceList renders every connected connector as a device, plus the ones we
+// remember from previous runs so the list survives an outage.
 func (s *Server) DeviceList() (int, any) {
+	return http.StatusOK, map[string]any{"connectors": s.connectorRecords(), "serverTime": view.Now()}
+}
+
+// connectorRecords merges live connectors with the remembered ones. A
+// remembered connector is reported as offline rather than dropped.
+func (s *Server) connectorRecords() []map[string]any {
 	ids := s.hub.IDs()
-	devices := make([]map[string]any, 0, len(ids))
+	seen := make(map[string]bool, len(ids))
+	records := make([]map[string]any, 0, len(ids))
 	for _, id := range ids {
-		devices = append(devices, view.DeviceView(id))
+		records = append(records, view.DeviceView(id))
+		seen[id] = true
 	}
-	return http.StatusOK, map[string]any{"connectors": devices, "serverTime": view.Now()}
+	stored, err := s.repo.ListConnectors()
+	if err != nil {
+		return records
+	}
+	for _, raw := range stored {
+		var saved map[string]any
+		if json.Unmarshal(raw, &saved) != nil {
+			continue
+		}
+		id := view.StringValue(saved["id"])
+		if id == "" || seen[id] {
+			continue
+		}
+		record := view.DeviceView(id)
+		record["status"] = "offline"
+		if name := view.StringValue(saved["name"]); name != "" {
+			record["name"] = name
+		}
+		records = append(records, record)
+	}
+	return records
 }
 
 // DeviceGet renders one connector.

@@ -4,7 +4,11 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 
+	"aa-server/internal/logic"
+	"aa-server/internal/view"
 	beegoctx "github.com/beego/beego/v2/server/web/context"
 )
 
@@ -119,8 +123,23 @@ func (c *Controller) sessionDetail(ctx *beegoctx.Context) {
 }
 
 func (c *Controller) sessionTimeline(ctx *beegoctx.Context) {
-	status, body := c.server.SessionTimeline(ctx.Input.Param(":id"))
+	query := logic.TimelineQuery{
+		Mode:           ctx.Input.Query("mode"),
+		Limit:          queryInt(ctx, "limit"),
+		AfterSeq:       queryInt(ctx, "afterSeq"),
+		BeforeOrderSeq: queryInt(ctx, "beforeOrderSeq"),
+	}
+	status, body := c.server.SessionTimeline(ctx.Input.Param(":id"), query)
 	writeJSON(ctx, status, body)
+}
+
+// queryInt reads an integer query parameter, defaulting to zero.
+func queryInt(ctx *beegoctx.Context, name string) int {
+	value, err := strconv.Atoi(ctx.Input.Query(name))
+	if err != nil {
+		return 0
+	}
+	return value
 }
 
 func (c *Controller) sessionSnapshot(ctx *beegoctx.Context) {
@@ -183,15 +202,65 @@ func (c *Controller) forwardSession(ctx *beegoctx.Context, method string) {
 }
 
 func (c *Controller) uploadAttachment(ctx *beegoctx.Context) {
-	status, body := c.server.SaveAttachment(ctx.Input.Param(":fileId"), ctx.Input.RequestBody)
-	writeJSON(ctx, status, body)
-}
-
-func (c *Controller) downloadAttachment(ctx *beegoctx.Context) {
-	path, err := c.server.AttachmentPath(ctx.Input.Param(":fileId"))
+	inputs, err := readUploads(ctx)
 	if err != nil {
 		writeJSON(ctx, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	http.ServeFile(ctx.ResponseWriter, ctx.Request, path)
+	status, body := c.server.SaveAttachments(ctx.Input.Param(":id"), inputs)
+	writeJSON(ctx, status, body)
+}
+
+func (c *Controller) downloadAttachment(ctx *beegoctx.Context) {
+	status, body := c.server.AttachmentDownload(ctx.Input.Param(":fileId"))
+	writeJSON(ctx, status, body)
+}
+
+// connectorAttachmentContent streams the raw bytes to the connector, which
+// stages them into the bridge directory before a turn can reference them.
+func (c *Controller) connectorAttachmentContent(ctx *beegoctx.Context) {
+	meta, data, err := c.server.AttachmentBlob(ctx.Input.Param(":id"), ctx.Input.Param(":fileId"))
+	if err != nil {
+		writeJSON(ctx, http.StatusNotFound, map[string]any{"error": "attachment not found"})
+		return
+	}
+	ctx.Output.Header("Content-Type", view.FirstNonEmpty(meta.MediaType, "application/octet-stream"))
+	ctx.Output.Header("X-File-Name", meta.Name)
+	ctx.Output.Header("X-File-Sha256", meta.SHA256)
+	_ = ctx.Output.Body(data)
+}
+
+// readUploads reads the multipart payload the client sends. A raw body is
+// accepted as well, so a plain command-line upload still works.
+func readUploads(ctx *beegoctx.Context) ([]logic.AttachmentInput, error) {
+	if strings.HasPrefix(ctx.Request.Header.Get("Content-Type"), "multipart/form-data") {
+		if err := ctx.Request.ParseMultipartForm(32 << 20); err != nil {
+			return nil, err
+		}
+		inputs := make([]logic.AttachmentInput, 0)
+		for _, headers := range ctx.Request.MultipartForm.File {
+			for _, header := range headers {
+				file, err := header.Open()
+				if err != nil {
+					return nil, err
+				}
+				data, err := io.ReadAll(io.LimitReader(file, 64<<20))
+				_ = file.Close()
+				if err != nil {
+					return nil, err
+				}
+				inputs = append(inputs, logic.AttachmentInput{
+					Name:      header.Filename,
+					MediaType: header.Header.Get("Content-Type"),
+					Data:      data,
+				})
+			}
+		}
+		return inputs, nil
+	}
+	data := ctx.Input.RequestBody
+	if len(data) == 0 {
+		return nil, nil
+	}
+	return []logic.AttachmentInput{{Name: "upload", MediaType: ctx.Request.Header.Get("Content-Type"), Data: data}}, nil
 }

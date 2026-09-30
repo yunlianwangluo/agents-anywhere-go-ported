@@ -1,7 +1,6 @@
 package view
 
 import (
-	"encoding/json"
 	"fmt"
 
 	"aa-server/internal/storage"
@@ -107,14 +106,16 @@ func RuntimeState(meta storage.SessionMeta, options RuntimeStateOptions) map[str
 }
 
 // SessionEnvelope is the single wire shape the client decodes for session
-// events, shared by recovery reads and live socket pushes.
+// events, shared by recovery reads and live socket pushes. The event id has to
+// identify the frame rather than only its position: one DSH log position carries
+// every streaming revision of an item, and the client ignores a repeated id.
 func SessionEnvelope(sessionID string, sequence int64, typeName string, payload any) map[string]any {
 	if payload == nil {
 		payload = map[string]any{}
 	}
 	return map[string]any{
 		"protocolVersion": "1.0",
-		"eventId":         fmt.Sprintf("%s:%d", sessionID, sequence),
+		"eventId":         fmt.Sprintf("%s:%d:%s", sessionID, sequence, frameIdentity(payload)),
 		"sequence":        sequence,
 		"cursor":          fmt.Sprintf("seq:%d", sequence),
 		"type":            typeName,
@@ -124,21 +125,24 @@ func SessionEnvelope(sessionID string, sequence int64, typeName string, payload 
 	}
 }
 
-// StoredSessionEvent wraps a stored connector record as the client event it
-// actually represents. Stored records are heterogeneous, so the type must come
-// from the payload shape: an `item` is a timeline upsert, `items` is a snapshot.
-// Records that carry neither (state-only updates) are not client events and must
-// be skipped, because the client rejects a timeline event that has no item.
-func StoredSessionEvent(sessionID string, sequence int64, value json.RawMessage) (map[string]any, bool) {
-	var record map[string]any
-	if json.Unmarshal(value, &record) != nil || record == nil {
-		return nil, false
+// frameIdentity distinguishes frames that legitimately share one sequence.
+func frameIdentity(payload any) string {
+	values, ok := payload.(map[string]any)
+	if !ok {
+		return "frame"
 	}
-	if item, ok := record["item"]; ok && item != nil {
-		return SessionEnvelope(sessionID, sequence, "timeline.item_updated", map[string]any{"item": item}), true
+	if item, ok := values["item"].(map[string]any); ok {
+		return fmt.Sprintf("item:%v:%v:%v", item["id"], item["revision"], item["status"])
 	}
-	if items, ok := record["items"]; ok && items != nil {
-		return SessionEnvelope(sessionID, sequence, "timeline.snapshot", map[string]any{"items": items}), true
+	if notice, ok := values["notice"].(map[string]any); ok {
+		return fmt.Sprintf("notice:%v:%v", FirstNonEmpty(StringValue(notice["noticeId"]), StringValue(notice["id"])), notice["revision"])
 	}
-	return nil, false
+	if state, ok := values["state"].(map[string]any); ok {
+		return fmt.Sprintf("state:%v:%v", StringValue(state["status"]), state["updatedSeq"])
+	}
+	if items, ok := values["items"].([]map[string]any); ok && len(items) > 0 {
+		last := items[len(items)-1]
+		return fmt.Sprintf("snapshot:%d:%v:%v", len(items), last["id"], last["revision"])
+	}
+	return "frame"
 }

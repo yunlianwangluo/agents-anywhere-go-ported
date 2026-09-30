@@ -8,3 +8,4 @@ bin/
 # Logs and OS noise
 *.log
 .DS_Store
+PERSISTENCE_TASKS.md

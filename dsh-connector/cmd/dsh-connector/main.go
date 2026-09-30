@@ -10,6 +10,7 @@ import (
 	"dsh-connector/internal/bridge"
 	"dsh-connector/internal/config"
 	"dsh-connector/internal/serverconn"
+	"dsh-connector/internal/staging"
 	"dsh-connector/internal/terminal"
 )
 
@@ -20,6 +21,19 @@ func stringParam(params map[string]any, key string) string {
 func numberParam(params map[string]any, key string) float64 {
 	value, _ := params[key].(float64)
 	return value
+}
+
+func bridgeRPCError(value any) (serverconn.RPCError, string, string, any) {
+	payload := mapValue(value)
+	code := fmt.Sprint(payload["code"])
+	if code == "<nil>" {
+		code = "DSH_BRIDGE_ERROR"
+	}
+	message := stringParam(payload, "message")
+	if message == "" {
+		message = code
+	}
+	return serverconn.RPCError{Payload: payload}, code, message, payload["details"]
 }
 
 // syncStream owns the bridge event subscription. The backend learns about new
@@ -231,7 +245,7 @@ func main() {
 
 	var dshBridge *bridge.Client
 	var connectBridge func(sessionID string)
-	var reportRuntimeError func(sessionID, code, message string)
+	var reportRuntimeError func(sessionID, code, message string, details any)
 	terminalManager := terminal.NewManager()
 	syncStream := newSyncStream()
 	handler := func(message map[string]any) (any, error) {
@@ -265,21 +279,40 @@ func main() {
 			}
 			return nil, fmt.Errorf("dsh bridge is unavailable")
 		}
+		// Attachments live on the backend; the bridge only reads them from its
+		// own staging directory, so download and place them before the call and
+		// remove the copies once it returned.
+		if references, ok := params["attachments"].([]any); ok && len(references) > 0 {
+			if sessionID := stringParam(params, "sessionId"); sessionID != "" {
+				payloads, cleanup, stageErr := staging.Stage(cfg.ServerURL, cfg.ClientKey, cfg.BridgeEndpoint, sessionID, references)
+				if stageErr != nil {
+					return nil, stageErr
+				}
+				defer cleanup()
+				params["attachments"] = payloads
+			}
+		}
 		response, err := dshBridge.Call(bridge.Request{JSONRPC: "2.0", ID: message["requestId"], Method: method, Params: params})
 		if err != nil {
+			reportRuntimeError(stringParam(params, "sessionId"), "DSH_BRIDGE_UNAVAILABLE", err.Error(), nil)
 			return nil, err
 		}
 		log.Printf("bridge rpc %s: %.400s", method, fmt.Sprint(response["result"]))
 		if errorValue, ok := response["error"]; ok {
-			return nil, fmt.Errorf("dsh bridge error: %v", errorValue)
+			rpcError, code, errorMessage, details := bridgeRPCError(errorValue)
+			reportRuntimeError(stringParam(params, "sessionId"), code, errorMessage, details)
+			return nil, rpcError
 		}
 		return response["result"], nil
 	}
 	client := serverconn.New(serverconn.Config{ServerURL: cfg.ServerURL, ConnectorID: cfg.ConnectorID, ClientKey: cfg.ClientKey}, handler)
 	// reportRuntimeError tells the backend that DSH itself is unusable, so the
 	// phone can show it instead of only the local log line.
-	reportRuntimeError = func(sessionID, code, message string) {
+	reportRuntimeError = func(sessionID, code, message string, details any) {
 		params := map[string]any{"runtime": "dsh", "runtimeId": "dsh", "code": code, "message": message}
+		if details != nil {
+			params["details"] = details
+		}
 		if sessionID != "" {
 			params["sessionId"] = sessionID
 		}
@@ -294,19 +327,19 @@ func main() {
 		endpoint, token, endpointErr := bridge.EndpointFromFile(cfg.BridgeEndpoint)
 		if endpointErr != nil {
 			log.Printf("dsh bridge unavailable: %v", endpointErr)
-			reportRuntimeError(sessionID, "DSH_BRIDGE_UNAVAILABLE", "DeepSeek Harness 未就绪："+endpointErr.Error())
+			reportRuntimeError(sessionID, "DSH_BRIDGE_UNAVAILABLE", "DeepSeek Harness 未就绪："+endpointErr.Error(), nil)
 			return
 		}
 		candidate := bridge.New(endpoint)
 		if endpointErr = candidate.Connect(); endpointErr != nil {
 			log.Printf("dsh bridge connection failed: %v", endpointErr)
-			reportRuntimeError(sessionID, "DSH_BRIDGE_UNAVAILABLE", "无法连接 DeepSeek Harness："+endpointErr.Error())
+			reportRuntimeError(sessionID, "DSH_BRIDGE_UNAVAILABLE", "无法连接 DeepSeek Harness："+endpointErr.Error(), nil)
 			return
 		}
 		if _, endpointErr = candidate.Initialize(token, cfg.ConnectorID); endpointErr != nil {
 			log.Printf("dsh bridge initialize failed: %v", endpointErr)
 			_ = candidate.Close()
-			reportRuntimeError(sessionID, "DSH_BRIDGE_UNAVAILABLE", "无法初始化 DeepSeek Harness："+endpointErr.Error())
+			reportRuntimeError(sessionID, "DSH_BRIDGE_UNAVAILABLE", "无法初始化 DeepSeek Harness："+endpointErr.Error(), nil)
 			return
 		}
 		candidate.SetNotificationHandler(func(message map[string]any) {

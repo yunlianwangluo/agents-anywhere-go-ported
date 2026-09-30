@@ -18,8 +18,8 @@ func sessionParams(meta storage.SessionMeta) map[string]any {
 	return params
 }
 
-// SessionNotices reads the pending interactions from the connector. Notices are
-// runtime-owned live facts: they are never stored locally.
+// SessionNotices returns connector notices together with persisted runtime
+// errors, which are server facts rather than timeline content.
 func (s *Server) SessionNotices(id string) (int, any) {
 	meta, err := s.repo.ReadMeta(id)
 	if err != nil {
@@ -28,30 +28,48 @@ func (s *Server) SessionNotices(id string) (int, any) {
 	return http.StatusOK, map[string]any{"notices": s.sessionNotices(meta), "serverTime": view.Now()}
 }
 
-// sessionNotices never fails: a missing notice list must not break the session.
+// sessionNotices merges persisted runtime errors when the connector is offline
+// or omits a server-generated notice.
 func (s *Server) sessionNotices(meta storage.SessionMeta) []map[string]any {
+	persisted, _ := s.repo.ReadRuntimeNotices(meta.ID)
 	result, err := s.CallConnector("session.getNotices", sessionParams(meta))
 	if err != nil {
-		return []map[string]any{}
+		return persisted
 	}
 	var payload map[string]any
 	if json.Unmarshal(result, &payload) != nil {
-		return []map[string]any{}
+		return persisted
 	}
-	return view.NormalizeNotices(payload["notices"], meta.ID)
+	notices := view.NormalizeNotices(payload["notices"], meta.ID)
+	present := make(map[string]bool, len(notices))
+	for _, notice := range notices {
+		present[view.StringValue(notice["noticeId"])] = true
+	}
+	for _, notice := range persisted {
+		if !present[view.StringValue(notice["noticeId"])] {
+			notices = append(notices, notice)
+		}
+	}
+	return notices
 }
 
-// runtimeState reads the live runtime state and falls back to idle when the
-// connector cannot answer, so the document is always decodable.
+// runtimeState reads the live runtime state, mirrors it for offline reads and
+// falls back to the mirror when the connector cannot answer, so the document is
+// always decodable.
 func (s *Server) runtimeState(meta storage.SessionMeta) map[string]any {
+	cached := s.cachedRuntimeState(meta)
+	if view.StringValue(cached["status"]) == "error" {
+		return cached
+	}
 	result, err := s.CallConnector("session.getState", sessionParams(meta))
 	if err != nil {
-		return view.RuntimeStateView(meta)
+		return cached
 	}
 	var payload map[string]any
 	if json.Unmarshal(result, &payload) != nil {
-		return view.RuntimeStateView(meta)
+		return cached
 	}
+	s.saveRuntimeState(meta.ID, payload)
 	return view.RuntimeState(meta, view.RuntimeStateOptions{
 		Status:       view.StringValue(payload["status"]),
 		Selections:   payload["selections"],
