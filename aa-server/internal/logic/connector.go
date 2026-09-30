@@ -2,6 +2,7 @@ package logic
 
 import (
 	"encoding/json"
+	"log"
 	"time"
 
 	"aa-server/internal/connector"
@@ -121,6 +122,31 @@ func (s *Server) CanonicalSessionID(value string) string {
 	return value
 }
 
+func connectorMapValue(value any) map[string]any {
+	result, _ := value.(map[string]any)
+	return result
+}
+
+func logConnectorNotification(connectorID, method, sessionID string, params map[string]any) {
+	switch method {
+	case "runtime.error", "session.state.update", "session.state.updated":
+		errorPayload := connectorMapValue(params["error"])
+		code := view.StringValue(errorPayload["code"])
+		if code == "" {
+			code = view.StringValue(params["code"])
+		}
+		message := view.StringValue(errorPayload["message"])
+		if message == "" {
+			message = view.StringValue(params["message"])
+		}
+		log.Printf("connector notification connectorId=%s method=%s sessionId=%s status=%s errorCode=%s errorMessage=%.240s", connectorID, method, sessionID, view.StringValue(params["status"]), code, message)
+	case "notice.upsert":
+		log.Printf("connector notification connectorId=%s method=%s sessionId=%s noticeId=%s status=%s type=%s", connectorID, method, sessionID, view.StringValue(params["noticeId"]), view.StringValue(params["status"]), view.StringValue(params["type"]))
+	default:
+		log.Printf("connector notification connectorId=%s method=%s sessionId=%s", connectorID, method, sessionID)
+	}
+}
+
 // IngestNotification persists a connector notification and fans it out to live
 // clients.
 func (s *Server) IngestNotification(connectorID string, message connector.Message) {
@@ -132,6 +158,7 @@ func (s *Server) IngestNotification(connectorID string, message connector.Messag
 	if sessionID != "" {
 		sessionID = s.CanonicalSessionID(sessionID)
 	}
+	logConnectorNotification(connectorID, message.Method, sessionID, params)
 	if message.Method == "runtime.error" {
 		s.pushRuntimeErrorNotice(sessionID, params)
 		return
@@ -150,8 +177,16 @@ func (s *Server) IngestNotification(connectorID string, message connector.Messag
 		// The client renders interactions from live notices, so a pending
 		// question must reach the session socket as a projection event.
 		s.PushSessionEvent(sessionID, s.timelineWatermark(sessionID), "runtime.notice.updated", map[string]any{"notice": view.NormalizeNotice(params, sessionID)})
-	case "session.state.update":
+	case "session.state.update", "session.state.updated":
 		s.saveRuntimeState(sessionID, params)
+		if view.StringValue(params["status"]) == "error" {
+			if errorPayload, ok := params["error"].(map[string]any); ok {
+				s.pushRuntimeErrorNotice(sessionID, map[string]any{
+					"code": errorPayload["code"], "message": errorPayload["message"], "details": errorPayload["details"],
+				})
+				return
+			}
+		}
 		s.PushSessionEvent(sessionID, s.timelineWatermark(sessionID), "runtime.state.updated", map[string]any{"state": view.RuntimeState(meta, view.RuntimeStateOptions{
 			Status:     view.StringValue(params["status"]),
 			Selections: params["selections"],

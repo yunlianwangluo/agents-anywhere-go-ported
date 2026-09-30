@@ -47,6 +47,33 @@ func TestRuntimeErrorPersistsStateAndNoticeForOfflineSnapshot(t *testing.T) {
 	}
 }
 
+func TestSessionStateUpdateErrorPersistsReadableNotice(t *testing.T) {
+	server, repo, _ := newTestServer(t)
+	const sessionID = "session-state-error"
+	if err := repo.SaveMeta(storage.SessionMeta{ID: sessionID, Runtime: "dsh"}); err != nil {
+		t.Fatalf("save meta: %v", err)
+	}
+
+	message := connector.Message{Method: "session.state.update", Params: []byte(`{"sessionId":"session-state-error","status":"error","statusReason":"Insufficient Balance","error":{"code":"QUOTA","message":"Insufficient Balance","details":{"request_id":"req-1"}}}`)}
+	server.IngestNotification("connector-1", message)
+	_, body := server.SessionNotices(sessionID)
+	notices := body.(map[string]any)["notices"].([]map[string]any)
+	if len(notices) != 1 || notices[0]["noticeId"] != "runtime-error-QUOTA" || notices[0]["message"] != "Insufficient Balance" || notices[0]["revision"] != float64(1) {
+		t.Fatalf("notices = %#v", notices)
+	}
+
+	server.IngestNotification("connector-1", message)
+	_, body = server.SessionNotices(sessionID)
+	notices = body.(map[string]any)["notices"].([]map[string]any)
+	if notices[0]["revision"] != float64(2) {
+		t.Fatalf("revision = %#v, want 2", notices[0]["revision"])
+	}
+	stored, err := repo.ReadState(sessionID)
+	if err != nil || !containsJSON(stored, `"code": "QUOTA"`) {
+		t.Fatalf("state = %s, err = %v", stored, err)
+	}
+}
+
 func containsJSON(value []byte, fragment string) bool {
 	for index := 0; index+len(fragment) <= len(value); index++ {
 		if string(value[index:index+len(fragment)]) == fragment {

@@ -36,6 +36,66 @@ func bridgeRPCError(value any) (serverconn.RPCError, string, string, any) {
 	return serverconn.RPCError{Payload: payload}, code, message, payload["details"]
 }
 
+type notificationSender interface {
+	Notify(string, any) error
+}
+
+type batchOperationError struct {
+	operation map[string]any
+	err       error
+}
+
+func (e *batchOperationError) Error() string { return e.err.Error() }
+func (e *batchOperationError) Unwrap() error { return e.err }
+
+func forwardBatch(operations []any, apply func(map[string]any) error, ack func() error) error {
+	for _, raw := range operations {
+		operation, _ := raw.(map[string]any)
+		if err := apply(operation); err != nil {
+			return &batchOperationError{operation: operation, err: err}
+		}
+	}
+	return ack()
+}
+
+func resetSnapshot(snapshotID, snapshotSession *string, items *[]any) {
+	*snapshotID, *snapshotSession, *items = "", "", (*items)[:0]
+}
+
+func operationSummary(operation map[string]any) string {
+	kind := stringParam(operation, "kind")
+	if kind != "notifications" {
+		return kind
+	}
+	notifications, _ := operation["notifications"].([]any)
+	if len(notifications) == 0 {
+		return kind
+	}
+	notice, _ := notifications[0].(map[string]any)
+	params := mapValue(notice["params"])
+	return fmt.Sprintf("%s method=%s sessionId=%s", kind, bridgeNotificationMethod(stringParam(notice, "method")), stringParam(params, "sessionId"))
+}
+
+func logForwardedNotification(method string, params any) {
+	payload := mapValue(params)
+	sessionID := stringParam(payload, "sessionId")
+	switch method {
+	case "session.state.update", "session.state.updated", "runtime.error":
+		errorPayload := mapValue(payload["error"])
+		code := stringParam(errorPayload, "code")
+		if code == "" {
+			code = stringParam(payload, "code")
+		}
+		message := stringParam(errorPayload, "message")
+		if message == "" {
+			message = stringParam(payload, "message")
+		}
+		log.Printf("forwarded notification method=%s sessionId=%s status=%s errorCode=%s errorMessage=%.240s", method, sessionID, stringParam(payload, "status"), code, message)
+	case "notice.upsert":
+		log.Printf("forwarded notification method=%s sessionId=%s noticeId=%s type=%s status=%s", method, sessionID, stringParam(payload, "noticeId"), stringParam(payload, "type"), stringParam(payload, "status"))
+	}
+}
+
 // syncStream owns the bridge event subscription. The backend learns about new
 // conversation content only through it, so it must subscribe after every
 // connect, acknowledge each ordered batch, and forward what it carries.
@@ -91,6 +151,7 @@ func (s *syncStream) consume(client *bridge.Client, server *serverconn.Client, s
 		if !client.Connected() {
 			return
 		}
+		resetSnapshot(&snapshotID, &snapshotSession, &items)
 		subscription, err := client.Call(bridge.Request{JSONRPC: "2.0", ID: "sync-subscribe", Method: "runtime.sync.subscribe"})
 		if err != nil {
 			log.Printf("runtime.sync.subscribe failed: %v", err)
@@ -135,20 +196,25 @@ func (s *syncStream) consume(client *bridge.Client, server *serverconn.Client, s
 			if len(operations) == 0 {
 				break
 			}
-			for _, raw := range operations {
-				operation, _ := raw.(map[string]any)
-				if applyOperation(operation, server, &snapshotID, &snapshotSession, &items) != nil {
-					break
+			if err := forwardBatch(operations, func(operation map[string]any) error {
+				return applyOperation(operation, server, &snapshotID, &snapshotSession, &items)
+			}, func() error {
+				ackResult, ackErr := client.Call(bridge.Request{JSONRPC: "2.0", ID: fmt.Sprintf("sync-ack-%d", expected), Method: "runtime.sync.ack",
+					Params: map[string]any{"streamId": streamID, "batchSeq": expected}})
+				if ackErr != nil {
+					return ackErr
 				}
-			}
-			ackResult, ackErr := client.Call(bridge.Request{JSONRPC: "2.0", ID: fmt.Sprintf("sync-ack-%d", expected), Method: "runtime.sync.ack",
-				Params: map[string]any{"streamId": streamID, "batchSeq": expected}})
-			if ackErr != nil {
-				log.Printf("runtime.sync.ack failed: %v", ackErr)
-				break
-			}
-			if code := stringParam(mapValue(ackResult["error"]), "code"); code != "" {
-				log.Printf("runtime.sync.ack rejected: %s", code)
+				if code := stringParam(mapValue(ackResult["error"]), "code"); code != "" {
+					return fmt.Errorf("rejected: %s", code)
+				}
+				return nil
+			}); err != nil {
+				resetSnapshot(&snapshotID, &snapshotSession, &items)
+				operation := map[string]any{}
+				if batchErr, ok := err.(*batchOperationError); ok {
+					operation = batchErr.operation
+				}
+				log.Printf("dsh batch forwarding failed batchSeq=%d operation=%s: %v; resubscribing without ACK", expected, operationSummary(operation), err)
 				break
 			}
 			expected++
@@ -160,7 +226,7 @@ func (s *syncStream) consume(client *bridge.Client, server *serverconn.Client, s
 }
 
 // applyOperation forwards one batch operation to the backend.
-func applyOperation(operation map[string]any, server *serverconn.Client, snapshotID, snapshotSession *string, items *[]any) error {
+func applyOperation(operation map[string]any, server notificationSender, snapshotID, snapshotSession *string, items *[]any) error {
 	switch stringParam(operation, "kind") {
 	case "snapshot.begin":
 		*snapshotID = stringParam(operation, "snapshotId")
@@ -179,13 +245,15 @@ func applyOperation(operation map[string]any, server *serverconn.Client, snapsho
 			return fmt.Errorf("snapshot commit without a capture")
 		}
 		meta, _ := operation["meta"].(map[string]any)
-		_ = server.Notify("timeline.sync", map[string]any{
+		if err := server.Notify("timeline.sync", map[string]any{
 			"sessionId":         *snapshotSession,
 			"externalSessionId": stringParam(meta, "externalSessionId"),
 			"items":             *items,
 			"complete":          true,
-		})
-		*snapshotID, *snapshotSession, *items = "", "", (*items)[:0]
+		}); err != nil {
+			return err
+		}
+		resetSnapshot(snapshotID, snapshotSession, items)
 		return nil
 	case "notifications":
 		notifications, _ := operation["notifications"].([]any)
@@ -196,8 +264,9 @@ func applyOperation(operation map[string]any, server *serverconn.Client, snapsho
 				continue
 			}
 			if err := server.Notify(method, notice["params"]); err != nil {
-				return err
+				return fmt.Errorf("notify method=%s sessionId=%s: %w", method, stringParam(mapValue(notice["params"]), "sessionId"), err)
 			}
+			logForwardedNotification(method, notice["params"])
 		}
 		return nil
 	default:
