@@ -186,6 +186,10 @@ func (s *Server) IngestNotification(connectorID string, message connector.Messag
 				})
 				return
 			}
+		} else if notices, err := s.repo.ResolveRuntimeErrorNotices(sessionID); err == nil {
+			for _, notice := range notices {
+				s.PushSessionEvent(sessionID, s.timelineWatermark(sessionID), "runtime.notice.updated", map[string]any{"notice": notice})
+			}
 		}
 		s.PushSessionEvent(sessionID, s.timelineWatermark(sessionID), "runtime.state.updated", map[string]any{"state": view.RuntimeState(meta, view.RuntimeStateOptions{
 			Status:     view.StringValue(params["status"]),
